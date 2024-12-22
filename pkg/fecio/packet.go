@@ -249,7 +249,7 @@ func (d *dataPacketWithMetadata) Reset() {
 	d.CurrentSize = packetHeadersSize
 	d.InVectorID = 0
 	d.VectorID = 0
-	d.Subpackets = d.DataPacket.Subpackets[:0]
+	d.DataPacket.Subpackets = d.DataPacket.Subpackets[:0]
 	if len(d.Buffers) != 0 {
 		panic(fmt.Errorf("internal error: len(d.Buffers) != 0: it was supposed to be freed by the sender handler"))
 	}

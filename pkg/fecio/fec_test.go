@@ -54,7 +54,7 @@ func newReadAndWriter(
 				RedundancyPackets: 1,
 			},
 		},
-		time.Second,
+		time.Millisecond,
 		1500,
 	)
 	require.NoError(t, err)
@@ -69,7 +69,7 @@ func TestFEC(t *testing.T) {
 		return Logger
 	}
 	mockClock := clock.NewMockClock(time.Unix(0, 0))
-	myClock = mockClock
+	//myClock = mockClock
 
 	Logger.Infof("opening the pipe")
 
@@ -182,7 +182,7 @@ func TestFEC(t *testing.T) {
 }
 
 func BenchmarkFEC(b *testing.B) {
-	Logger = Logger.WithLevel(logger.LevelWarning)
+	Logger = Logger.WithLevel(logger.LevelDebug)
 	myClock = clock.DefaultClock{}
 	nr, nw := io.Pipe()
 
@@ -214,12 +214,9 @@ func BenchmarkFEC(b *testing.B) {
 		fw.Close()
 	}()
 
-	messages := [][]byte{
-		{8, 1},
-		{8, 2},
-		{8, 3},
-		{8, 4},
-		{8, 5},
+	messages := make([][]byte, 5)
+	for idx := range messages {
+		messages[idx] = make([]byte, idx*100)
 	}
 
 	dw.writeFunc = dw.backendWriter.Write
@@ -241,8 +238,7 @@ func BenchmarkFEC(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		n, err := fr.Read(buf)
+		_, err := fr.Read(buf)
 		require.NoError(b, err)
-		require.Equal(b, 2, n)
 	}
 }

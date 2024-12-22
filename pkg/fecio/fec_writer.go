@@ -10,23 +10,23 @@ import (
 	"time"
 
 	"github.com/facebookincubator/go-belt/tool/logger"
-	"github.com/mixer/clock"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/templexxx/reedsolomon"
 )
 
 type fecWriter struct {
 	backend                      io.WriteCloser
+	rsConfigs                    []RedundancyConfiguration
+	rsCache                      *rsCache
 	isClosed                     bool
 	cancelFunc                   context.CancelFunc
 	currentVectorID              uint32
 	nextInVectorID               uint8
-	reedSolomon                  []*reedsolomon.RS
 	currentDataPacket            *dataPacketWithMetadata
 	sendingBuffer                chan *dataPacketWithMetadata
 	locker                       sync.Mutex
 	maxPacketSize                uint16
 	accumulateTime               time.Duration
-	sendTimer                    clock.Timer
 	launchTimerIfNotLaunchedChan chan struct{}
 	triggerSendingNowChan        chan struct{}
 	writerConfig                 writerConfig
@@ -67,7 +67,7 @@ func NewFECWriter(
 		if cfgA.DataPackets == cfgB.DataPackets {
 			err = fmt.Errorf("received two equivalent configurations: %#+v == %#+v", cfgA, cfgB)
 		}
-		return cfgA.DataPackets < cfgB.DataPackets
+		return cfgA.DataPackets > cfgB.DataPackets
 	})
 	if err != nil {
 		return nil, err
@@ -75,17 +75,8 @@ func NewFECWriter(
 
 	Logger.Debugf("cfgs == %v", cfgs)
 
-	var (
-		rss                     []*reedsolomon.RS
-		maxDataPacketsPerVector uint8
-	)
+	var maxDataPacketsPerVector uint8
 	for _, cfg := range cfgs {
-		rs, err := reedsolomon.New(int(cfg.DataPackets), int(cfg.RedundancyPackets))
-		if err != nil {
-			return nil, fmt.Errorf("unable to initialize Reed-Solomon handler: %w", err)
-		}
-		rss = append(rss, rs)
-
 		if cfg.DataPackets <= 0 {
 			return nil, fmt.Errorf("a configuration with non-positive value of data packets")
 		}
@@ -100,17 +91,22 @@ func NewFECWriter(
 		}
 	}
 
+	rsCache, err := lru.New[RedundancyConfiguration, *reedsolomon.RS](MaxDataPacketsPerVector * MaxRedundancyPacketsPerVector)
+	if err != nil {
+		return nil, fmt.Errorf("unable to initialize the cache structure: %w", err)
+	}
+
 	fecW := &FECWriter{
 		fecWriter: &fecWriter{
 			backend:                      w,
+			rsConfigs:                    cfgs,
+			rsCache:                      rsCache,
 			accumulateTime:               accumulateTime,
 			maxPacketSize:                maxPacketSize,
-			sendTimer:                    myClock.NewTimer(0),
 			launchTimerIfNotLaunchedChan: make(chan struct{}, 1),
 			triggerSendingNowChan:        make(chan struct{}, 1),
 			sendingBuffer:                make(chan *dataPacketWithMetadata, 2*maxDataPacketsPerVector),
 			writerConfig:                 WriterOpts(opts).config(),
-			reedSolomon:                  rss,
 			payloadPool: sync.Pool{
 				New: func() any {
 					return ptr(make([]byte, 0, maxPacketSize))
@@ -138,7 +134,6 @@ func NewFECWriter(
 
 	fecW.currentDataPacket = fecW.dataPacketPool.Get().(*dataPacketWithMetadata)
 	fecW.currentDataPacket.Reset()
-	fecW.sendTimer.Stop()
 
 	fecW.init()
 	return fecW, nil
@@ -165,12 +160,18 @@ func (w *fecWriter) Close() error {
 }
 
 func (w *fecWriter) loop(ctx context.Context) {
+	iterationTime := w.accumulateTime / 10
+	if iterationTime == 0 {
+		iterationTime = time.Nanosecond
+	}
+	t := myClock.NewTicker(iterationTime)
 	defer func() {
-		Logger.Tracef("/loop")
-		defer w.sendTimer.Stop()
+		Logger.Debugf("/loop")
+		t.Stop()
 		go w.Close()
 	}()
 	timerStarted := false
+	nextTriggerAt := myClock.Now().Add(time.Hour * 24 * 365 * 100)
 	for {
 		select {
 		case <-ctx.Done():
@@ -180,20 +181,30 @@ func (w *fecWriter) loop(ctx context.Context) {
 				Logger.Tracef("received a launch timer signal: but it is already started")
 				continue
 			}
-			w.sendTimer.Reset(w.accumulateTime)
+			nextTriggerAt = myClock.Now().Add(w.accumulateTime)
 			timerStarted = true
 			Logger.Tracef("received a launch timer signal: started")
 		case <-w.triggerSendingNowChan:
 			Logger.Tracef("<-w.triggerSendingNowChan")
-			w.sendTimer.Stop()
+			nextTriggerAt = myClock.Now().Add(time.Hour * 24 * 365 * 100)
 			timerStarted = false
 			if err := w.sendEverythingNow(); err != nil {
 				Logger.Debugf("received an error on sending the packets: %v", err)
 				return
 			}
-		case <-w.sendTimer.Chan():
-			Logger.Tracef("<-w.sendTimer.Chan()")
-			timerStarted = false
+		case <-t.Chan():
+			now := myClock.Now()
+			Logger.Tracef("<-t.C: %v %v", now, nextTriggerAt)
+			if !timerStarted {
+				Logger.Tracef("<-t.C: !timerStarted")
+				continue
+			}
+			if !now.After(nextTriggerAt) {
+				Logger.Tracef("<-t.C: !time.Now().After(nextTriggerAt)")
+				continue
+			}
+			Logger.Tracef("<-t.C: w.sendTimer.Reset(time.Nanosecond)")
+			nextTriggerAt = myClock.Now().Add(time.Hour * 24 * 365 * 100)
 			if err := w.sendEverythingNow(); err != nil {
 				Logger.Debugf("received an error on sending the packets: %v", err)
 				return
@@ -224,6 +235,10 @@ func (w *fecWriter) Write(
 	minimalPacketSize := len(msg) + int(packetHeadersSize) + int(dataSubpacketHeadersSize)
 	if minimalPacketSize > int(w.maxPacketSize)-int(redundancyConfiguration) {
 		return 0, fmt.Errorf("the packet is too large: %d > %d", minimalPacketSize, w.maxPacketSize-redundancyConfiguration)
+	}
+
+	if len(msg) == 0 {
+		return 0, nil
 	}
 
 	msgPtr := &msg
@@ -269,6 +284,12 @@ func (w *fecWriter) sendCurrentPacket() (_err error) {
 	curPkt := w.currentDataPacket
 	if curPkt.CurrentSize <= dataSubpacketHeadersSize {
 		return fmt.Errorf("an empty packet")
+	}
+	if len(curPkt.Subpackets) == 0 {
+		panic(fmt.Errorf("internal error: len(curPkt.Subpackets) == 0"))
+	}
+	if len(curPkt.Subpackets[0].Payload) == 0 {
+		panic(fmt.Errorf("internal error: len(curPkt.Subpackets[0].Payload) == 0"))
 	}
 	w.currentDataPacket = w.dataPacketPool.Get().(*dataPacketWithMetadata)
 	w.currentDataPacket.Reset()
@@ -328,10 +349,6 @@ func (w *fecWriter) triggerSendingNow() {
 
 func (w *fecWriter) flushTriggers() {
 	select {
-	case <-w.sendTimer.Chan():
-	default:
-	}
-	select {
 	case <-w.triggerSendingNowChan:
 	default:
 	}
@@ -370,9 +387,14 @@ func (w *fecWriter) sendParityNow() error {
 		if pendingCount == 0 {
 			return nil
 		}
-		rs := w.findRS(pendingCount)
-		if rs.DataNum > int(pendingCount) {
-			return fmt.Errorf("internal error: found a ReedSolomon handler with DataNum greater than the amount of Data messages we have: %d > %d", rs.DataNum, pendingCount)
+		cfg := w.findRSConfig(pendingCount)
+		if int(cfg.DataPackets) > int(pendingCount) {
+			return fmt.Errorf("internal error: found a ReedSolomon handler with DataNum greater than the amount of Data messages we have: %d > %d", cfg.DataPackets, pendingCount)
+		}
+		cfg.DataPackets = uint8(len(w.sendingBuffer))
+		rs, err := w.getReedSolomon(cfg)
+		if err != nil {
+			return fmt.Errorf("unable to initialize a Reed Solomon handler: %w", err)
 		}
 
 		var (
@@ -381,7 +403,7 @@ func (w *fecWriter) sendParityNow() error {
 			maxMessageSize int
 			packetHeaders  PacketHeaders
 		)
-		for range rs.DataNum {
+		for range cfg.DataPackets {
 			select {
 			case pkt := <-w.sendingBuffer:
 				Logger.Tracef("a data packet %d:%d for parity calculations", pkt.VectorID, pkt.InVectorID)
@@ -413,15 +435,15 @@ func (w *fecWriter) sendParityNow() error {
 					w.dataPacketPool.Put(pkt)
 				}
 			default:
-				return fmt.Errorf("internal error: do not have enough messages, read %d, expected %d", len(messages), rs.DataNum)
+				return fmt.Errorf("internal error: do not have enough messages, read %d, expected %d", len(messages), cfg.DataPackets)
 			}
 		}
 
-		for i := range rs.DataNum {
+		for i := range messages {
 			messages[i] = messages[i][:maxMessageSize]
 		}
 
-		for range rs.ParityNum {
+		for range cfg.RedundancyPackets {
 			msgPtr := getSliceFromPool[byte](&w.payloadPool, maxMessageSize)
 			messageBufs = append(messageBufs, msgPtr)
 			messages = append(messages, *msgPtr)
@@ -432,21 +454,21 @@ func (w *fecWriter) sendParityNow() error {
 			}
 		}
 
-		err := rs.Encode(messages)
+		err = rs.Encode(messages)
 		if err != nil {
 			return fmt.Errorf("unable to build parity messages: %w", err)
 		}
 
-		parityMessages := messages[rs.DataNum:]
+		parityMessages := messages[cfg.DataPackets:]
 		pkt := &w.parityPacket
 		pkt.Serialized = pkt.Serialized[:int(parityPacketHeadersSize)+maxMessageSize]
 		pkt.SetVectorID(packetHeaders.VectorID)
 		pkt.SetRedundancyConfiguration(RedundancyConfiguration{
-			DataPackets:       uint8(rs.DataNum),
-			RedundancyPackets: uint8(rs.ParityNum),
+			DataPackets:       uint8(cfg.DataPackets),
+			RedundancyPackets: uint8(cfg.RedundancyPackets),
 		})
 		for idx, msg := range parityMessages {
-			pkt.SetInVectorID(uint8(rs.DataNum + idx))
+			pkt.SetInVectorID(uint8(int(cfg.DataPackets) + idx))
 			pkt.SetPayload(msg)
 			pkt.CalculateChecksum()
 			Logger.Tracef("sending message %X:%#+v (len: %d) with a parity packet via the backend", pkt.Serialized, pkt.ParityPacket, len(pkt.Serialized))
@@ -468,17 +490,38 @@ func (w *fecWriter) sendParityNow() error {
 	}
 }
 
-func (w *fecWriter) findRS(dataPacketsNum uint) *reedsolomon.RS {
-	idx := sort.Search(len(w.reedSolomon), func(i int) bool {
-		return w.reedSolomon[i].DataNum >= int(dataPacketsNum)
-	})
-	Logger.Tracef("findRS: idx == %d", idx)
-	if idx >= len(w.reedSolomon) {
-		idx = len(w.reedSolomon) - 1
+func (w *fecWriter) getReedSolomon(
+	cfg RedundancyConfiguration,
+) (*reedsolomon.RS, error) {
+	rs, ok := w.rsCache.Get(cfg)
+	if ok {
+		return rs, nil
 	}
-	Logger.Tracef("findRS: corrected idx == %d", idx)
 
-	return w.reedSolomon[idx]
+	rs, err := reedsolomon.New(int(cfg.DataPackets), int(cfg.RedundancyPackets))
+	if err != nil {
+		return nil, fmt.Errorf("unable to initialize a Reed-Solomon handler: %w", err)
+	}
+
+	w.rsCache.Add(cfg, rs)
+	return rs, nil
+}
+
+func (w *fecWriter) findRSConfig(dataPacketsNum uint) RedundancyConfiguration {
+	idx := sort.Search(len(w.rsConfigs), func(i int) bool {
+		return int(dataPacketsNum) >= int(w.rsConfigs[i].DataPackets)
+	})
+	Logger.Tracef("findRSConfig: idx == %d", idx)
+	if idx >= len(w.rsConfigs) {
+		idx = len(w.rsConfigs) - 1
+	}
+	Logger.Tracef("findRSConfig: corrected idx == %d", idx)
+
+	cfg := w.rsConfigs[idx]
+	if int(cfg.DataPackets) > int(dataPacketsNum) {
+		panic(fmt.Errorf("internal error: rs.DataNum > int(dataPacketsNum): %d > %d", cfg.DataPackets, int(dataPacketsNum)))
+	}
+	return cfg
 }
 
 func (w *fecWriter) MaxDataPacketsPerVector() uint8 {

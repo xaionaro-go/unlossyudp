@@ -47,7 +47,7 @@ func NewFECReader(
 	if !isPowerOfTwo(maxWindowSize) {
 		return nil, fmt.Errorf("due to design limitations of the reader, the maxWindowSize needs to be a power of 2, but it is %d", maxWindowSize)
 	}
-	rsCache, err := lru.New[RedundancyConfiguration, *reedsolomon.RS](64)
+	rsCache, err := lru.New[RedundancyConfiguration, *reedsolomon.RS](MaxDataPacketsPerVector * MaxRedundancyPacketsPerVector)
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize the cache structure: %w", err)
 	}
