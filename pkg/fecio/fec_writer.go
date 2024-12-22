@@ -205,6 +205,7 @@ func (w *fecWriter) loop(ctx context.Context) {
 			}
 			Logger.Tracef("<-t.C: w.sendTimer.Reset(time.Nanosecond)")
 			nextTriggerAt = myClock.Now().Add(time.Hour * 24 * 365 * 100)
+			timerStarted = false
 			if err := w.sendEverythingNow(); err != nil {
 				Logger.Debugf("received an error on sending the packets: %v", err)
 				return
