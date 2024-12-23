@@ -5,5 +5,5 @@ import (
 )
 
 var (
-	Logger logger.Logger = logger.Default()
+	Logger logger.Logger = logger.Default().WithLevel(logger.LevelWarning)
 )
