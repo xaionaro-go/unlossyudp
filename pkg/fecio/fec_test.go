@@ -214,9 +214,9 @@ func BenchmarkFEC(b *testing.B) {
 		fw.Close()
 	}()
 
-	messages := make([][]byte, 5)
+	messages := make([][]byte, 1)
 	for idx := range messages {
-		messages[idx] = make([]byte, idx*100)
+		messages[idx] = make([]byte, 100)
 	}
 
 	dw.writeFunc = dw.backendWriter.Write
@@ -237,6 +237,7 @@ func BenchmarkFEC(b *testing.B) {
 	buf := make([]byte, 3000)
 	b.ResetTimer()
 	b.ReportAllocs()
+	b.SetBytes(100)
 	for i := 0; i < b.N; i++ {
 		_, err := fr.Read(buf)
 		require.NoError(b, err)
